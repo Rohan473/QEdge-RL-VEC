@@ -77,6 +77,42 @@ def predict(features: np.ndarray, model=None) -> Tuple[int, float]:
     return pred, prob
 
 
+def compute_action_costs(features: np.ndarray, model=None, drop_penalty: float = 1.2) -> dict:
+    """
+    Compute relative costs for four actions: local, edge_server_1, edge_server_2, drop.
+
+    Returns a dict with keys: 'local', 'edge_1', 'edge_2', 'drop'. Values are floats
+    normalized so the minimum cost is 1.0 (relative costs).
+    """
+    features = np.asarray(features).ravel()
+    # get model prediction and confidence (loads model if needed)
+    try:
+        _, prob = predict(features, model=model)
+    except Exception:
+        prob = 0.5
+
+    # simple feature-derived factor
+    norm = float(np.linalg.norm(features)) / max(1.0, features.size)
+
+    # raw costs: lower model confidence -> higher costs
+    raw_local = (1.0 - prob) + 0.5 * norm
+    raw_edge_1 = (1.0 - prob) + 0.2 + 0.3 * norm
+    raw_edge_2 = (1.0 - prob) + 0.25 + 0.15 * norm
+    raw_drop = float(drop_penalty)
+
+    raws = {
+        "local": max(1e-6, raw_local),
+        "edge_1": max(1e-6, raw_edge_1),
+        "edge_2": max(1e-6, raw_edge_2),
+        "drop": max(1e-6, raw_drop),
+    }
+
+    # normalize so the minimum cost becomes 1.0 for easier interpretation
+    min_raw = min(raws.values())
+    costs = {k: float(v / min_raw) for k, v in raws.items()}
+    return costs
+
+
 if __name__ == "__main__":
     acc, path = train()
     print(f"Trained classical model; validation accuracy: {acc:.4f}; saved to {path}")
