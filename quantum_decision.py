@@ -39,48 +39,97 @@ def heuristic_should_offload(features: np.ndarray, model_confidence: float, thre
     return (model_confidence < threshold) and (norm > (features.size * 0.5))
 
 
-def _quantum_score_simulation(features: np.ndarray, seed: int = 42) -> float:
+def _sample_by_prob_dict(pdict: dict, rng: np.random.RandomState = None) -> str:
+    """Sample a single key from a probability dict (values sum to 1)."""
+    keys = list(pdict.keys())
+    probs = np.array([pdict[k] for k in keys], dtype=float)
+    probs = probs / probs.sum()
+    if rng is None:
+        rng = np.random.RandomState()
+    choice = rng.choice(len(keys), p=probs)
+    return keys[choice]
+
+
+def select_action_from_costs(costs: dict, shots: int = 1, seed: int = 42, force_quantum: bool = False) -> Tuple[str, str, dict]:
     """
-    Minimal quantum-inspired routine using Qiskit statevector simulation.
-    Produces a deterministic score in [0, 1] derived from a small circuit.
-    Falls back to a simple deterministic mapping if Qiskit not available.
+    Use a 2-qubit quantum circuit to probabilistically se zlect one of four actions based on costs.
+
+    Arguments:                          
+        costs: dict with keys 'local','edge_1','edge_2','drop' and positive numeric costs.
+        shots: number of measurement shots (default 1). We return the most frequent outcome if >1.
+        seed: RNG seed for simulator or fallback.
+        force_quantum: if False and Qiskit not available, fallback to classical sampling.
+
+    Returns: (measured_bitstring, decoded_action, details)
+    details includes intermediate probabilities and used angles.
     """
-    features = np.asarray(features).ravel()
-    # Normalize to [0, pi/2] for rotation angles — keep mapping stable across runs
-    if features.size == 0:
-        return 0.0
-    angles = (features - features.min()) / (np.ptp(features) + 1e-9) * (np.pi / 2)
-    if HAS_QISKIT:
+    # convert costs to preferences (higher preference for lower cost)
+    prefs = {k: 1.0 / max(1e-9, float(v)) for k, v in costs.items()}
+    total = sum(prefs.values())
+    p_action = {k: float(v / total) for k, v in prefs.items()}
+
+    # Marginals for each qubit (bit order is b1 b0, left to right)
+    # mapping: 00->local, 01->edge_1, 10->edge_2, 11->drop
+    p_qubit0_1 = p_action["edge_1"] + p_action["drop"]  # LSB
+    p_qubit1_1 = p_action["edge_2"] + p_action["drop"]  # MSB
+
+    # convert marginal probabilities into Ry angles for each qubit
+    # For a single qubit, Ry(theta) on |0> gives P(1) = sin^2(theta/2)
+    def theta_from_p(p):
+        p = float(min(max(p, 0.0), 1.0))
+        return 2.0 * float(np.arcsin(np.sqrt(p)))
+
+    theta0 = theta_from_p(p_qubit0_1)
+    theta1 = theta_from_p(p_qubit1_1)
+
+    details = {
+        "p_action": p_action,
+        "p_qubit0_1": p_qubit0_1,
+        "p_qubit1_1": p_qubit1_1,
+        "theta0": float(theta0),
+        "theta1": float(theta1),
+    }
+
+    # If Qiskit available and requested, run a 2-qubit circuit
+    if HAS_QISKIT and force_quantum:
         try:
-            # small circuit: ry rotations + hadamards, measure expectation-like score from statevector
-            n_qubits = min(6, features.size)  # cap number of qubits to keep simulation cheap
-            qc = QuantumCircuit(n_qubits)
-            # map angles to first n_qubits
-            for i in range(n_qubits):
-                qc.ry(float(angles[i % angles.size]), i)
-            # add a layer of H to create superposition
-            qc.h(range(n_qubits))
-            # simulate statevector
-            backend = Aer.get_backend("statevector_simulator")
+            backend = Aer.get_backend("qasm_simulator")
+            qc = QuantumCircuit(2, 2)
+            # Put both qubits into superposition
+            qc.h([0, 1])
+            # Apply Ry rotations to bias each qubit according to marginals
+            qc.ry(theta0, 0)
+            qc.ry(theta1, 1)
+            # Measure qubits into classical bits; map qubit1 -> bit1, qubit0 -> bit0
+            qc.measure([1, 0], [1, 0])
             qc = transpile(qc, backend=backend)
-            result = backend.run(qc).result()
-            state = result.get_statevector(qc)
-            # compute a simple score: sum of squared magnitudes for basis states where MSB is 1
-            # This gives a reproducible scalar in [0,1]
-            probs = np.abs(state) ** 2
-            half = len(probs) // 2
-            score = float(probs[half:].sum())
-            return score
+            job = backend.run(qc, shots=shots, seed_simulator=seed)
+            result = job.result()
+            counts = result.get_counts(qc)
+            # choose most frequent outcome
+            measured = max(counts.items(), key=lambda kv: kv[1])[0]
+            # ensure bitstring length 2
+            if len(measured) == 1:
+                measured = "0" + measured
+            # decode mapping
+            mapping = {"00": "LOCAL", "01": "EDGE_SERVER_1", "10": "EDGE_SERVER_2", "11": "DROP_TASK"}
+            action = mapping.get(measured, "UNKNOWN")
+            details["counts"] = counts
+            return measured, action, details
         except Exception as e:
-            logger.warning("Qiskit simulation failed: %s. Falling back to deterministic mapping.", e)
-    # Fallback deterministic mapping (no qiskit)
-    # Map mean and variance into [0,1]
-    m = float(np.mean(features))
-    s = float(np.std(features))
-    score = 1.0 / (1.0 + np.exp(- (m / (s + 1e-6))))
-    # clamp
-    score = max(0.0, min(1.0, score))
-    return score
+            logger.warning("Quantum circuit failed (%s), falling back to classical sampling.", e)
+
+    # Fallback: classical probabilistic sampling using p_action
+    rng = np.random.RandomState(seed)
+    choice = _sample_by_prob_dict(p_action, rng=rng)
+    # convert sampled action key into bitstring according to mapping
+    # We have keys 'local','edge_1','edge_2','drop'
+    reverse_map = {"local": "00", "edge_1": "01", "edge_2": "10", "drop": "11"}
+    measured = reverse_map[choice]
+    mapping = {"00": "LOCAL", "01": "EDGE_SERVER_1", "10": "EDGE_SERVER_2", "11": "DROP_TASK"}
+    action = mapping[measured]
+    details["sampled_choice"] = choice
+    return measured, action, details
 
 
 def should_offload(features: np.ndarray, model_confidence: float, force_quantum: bool = False,
@@ -95,11 +144,7 @@ def should_offload(features: np.ndarray, model_confidence: float, force_quantum:
        - 'score' or 'model_confidence' etc.
     """
     features = np.asarray(features).ravel()
-    if force_quantum and HAS_QISKIT:
-        score = _quantum_score_simulation(features)
-        decision = score > quantum_threshold
-        return decision, {"method": "quantum", "score": score, "threshold": quantum_threshold}
-    # Otherwise use heuristic. If Qiskit available and not forced we still prefer heuristic in this simple demo.
+    # Keep original heuristic behavior available
     decision = heuristic_should_offload(features, model_confidence, threshold=heuristic_threshold)
     return decision, {"method": "heuristic", "model_confidence": float(model_confidence)}
 
@@ -109,5 +154,10 @@ if __name__ == "__main__":
     sample = [0.1, 0.2, -0.5, 1.2, 0.0, 0.3, 0.6, -0.1]
     print("Has Qiskit:", HAS_QISKIT)
     print("Heuristic offload:", should_offload(sample, model_confidence=0.65))
-    if HAS_QISKIT:
-        print("Quantum score:", _quantum_score_simulation(sample))
+    # Example of the new 2-qubit selection (classical fallback if qiskit not installed)
+    from classical_model import compute_action_costs
+    costs = compute_action_costs(np.array(sample))
+    measured, action, details = select_action_from_costs(costs, shots=1, seed=42, force_quantum=False)
+    print("Costs:", costs)
+    print("Measured:", measured)
+    print("Action:", action)
