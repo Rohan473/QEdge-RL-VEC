@@ -34,7 +34,3 @@ Quick start
 
 Notes
 - The quantum decision routine is optional and will only be used if Qiskit is available; otherwise a deterministic heuristic is used.
-- This repository is intended as a template / demo. Replace the synthetic data and decision logic with real models and decision criteria for production use.
-
-License
-- MIT (add your license file as needed)
