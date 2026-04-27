@@ -1,0 +1,29 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Trained model checkpoints
+checkpoints/*.pt
+checkpoints/*.npz
+
+# Training artefacts
+logs/
+results/dqn_returns.npy
+results/qrl_returns.npy
+
+# Legacy model files (existing repo artefacts)
+classical_model.joblib
+dqn_offload.pt
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
